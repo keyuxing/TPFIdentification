@@ -1,0 +1,52 @@
+# This workflow will install Python dependencies, run tests and lint with a single version of Python
+# For more information see: https://help.github.com/actions/language-and-framework-guides/using-python-with-github-actions
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      PRJ_ENV: test
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Python 3.10.4
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.10.4
+
+      - name: Install pip packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install wheel
+          pip install black
+          pip install lightkurve
+
+      - name: Code format check with black
+        run: |
+          black --check . -l 119
+
+      - name: Download data
+        run: |
+          cd tpfs
+          curl -C - -L -o tess2019198215352-s0014-0000000159509446-0150-s_tp.fits https://mast.stsci.edu/api/v0.1/Download/file/?uri=mast:TESS/product/tess2019198215352-s0014-0000000159509446-0150-s_tp.fits
+          curl -C - -L -o kplr001161345-2013121191144_spd-targ.fits.gz https://mast.stsci.edu/api/v0.1/Download/file?uri=mast:Kepler/url/missions/kepler/target_pixel_files/0011/001161345//kplr001161345-2013121191144_spd-targ.fits.gz
+          wget -q https://archive.stsci.edu/missions/k2/target_pixel_files/c18/211700000/65000/ktwo211765471-c18_spd-targ.fits.gz
+
+      - name: Test plot
+        run: |
+          python tpf_identification.py
+
+      - name: Upload results
+        uses: actions/upload-artifact@main
+        with:
+          name: Results
+          path: results/
