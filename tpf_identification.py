@@ -8,7 +8,6 @@ from astroquery.simbad import Simbad
 from astroquery.vizier import Vizier
 from astroquery.mast import Catalogs
 from astroquery.hips2fits import hips2fits
-from lightkurve.targetpixelfile import KeplerTargetPixelFile, TessTargetPixelFile
 from matplotlib import patches
 from matplotlib.colorbar import Colorbar
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -204,7 +203,7 @@ def get_sky_img(tpf, theta, x_length, y_length, tpf_radius, reverse):
     return x_pixel_rotated, y_pixel_rotated, sky_img
 
 
-def plot_identification(ax_sky, tpf: KeplerTargetPixelFile | TessTargetPixelFile):
+def plot_identification(ax_sky, tpf):
     divider = make_axes_locatable(ax_sky)
     ax_tpf = divider.append_axes("right", size="100%", pad=0.1)
     ax_cb = divider.append_axes("right", size="8%", pad=0.35)
