@@ -10,7 +10,7 @@ location containing numerous stars since the nearby stars will contaminate the l
 the target. In each module, the right panel presents the target, marked by cross symbol,
 taken from TESS target pixel files. The size of the circle indicates the relative 
 brightness of the stars. The left panel presents the same sky coverage but from 
-[DSS2 Red 2 survey](https://skyview.gsfc.nasa.gov/current/cgi/moreinfo.pl?survey=DSS2%20Red).
+[DSS2 Red survey](https://skyview.gsfc.nasa.gov/current/cgi/moreinfo.pl?survey=DSS2%20Red).
 
 This repository is revised based on 
 [_tpfplotter_](https://github.com/jlillo/tpfplotter). 
