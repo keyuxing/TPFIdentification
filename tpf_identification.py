@@ -1,22 +1,30 @@
+import warnings
+from typing import Tuple, Union
+
 from astropy import units as u
-from astropy.coordinates import SkyCoord, Angle
-from astropy.table import vstack
+from astropy.coordinates import Angle, SkyCoord
+from astropy.table import QTable
+from astropy.time import Time
 from astropy.visualization import LogStretch
 from astropy.visualization.mpl_normalize import ImageNormalize
 from astropy.wcs import Wcsprm
-from astroquery.simbad import Simbad
-from astroquery.vizier import Vizier
-from astroquery.mast import Catalogs
+from astroquery.gaia import Gaia
 from astroquery.hips2fits import hips2fits
+from erfa import ErfaWarning
+from lightkurve import TessTargetPixelFile, KeplerTargetPixelFile
 from matplotlib import patches
+from matplotlib.axes import Axes
 from matplotlib.colorbar import Colorbar
+from matplotlib.offsetbox import AnchoredText
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import numpy as np
 
-Vizier.ROW_LIMIT = -1
+Gaia.MAIN_GAIA_TABLE = "gaiadr3.gaia_source"
+Gaia.ROW_LIMIT = -1
+REF_EPOCH = Time("J2016")
 
 
-def calculate_theta(w: Wcsprm):
+def calculate_theta(w: Wcsprm) -> Tuple[float, bool]:
     """
     Calculates the rotation angle of TPF according to the wcs in the FITS Header.
 
@@ -31,6 +39,7 @@ def calculate_theta(w: Wcsprm):
     reverse: bool
         Whether the direction of the TPF is reversed
     """
+
     pc = w.pc
     cdelt = w.cdelt
     cd = cdelt * pc
@@ -42,116 +51,157 @@ def calculate_theta(w: Wcsprm):
     cdelt1 = sgn * np.sqrt(cd[0, 0] ** 2 + cd[0, 1] ** 2)
 
     if cdelt1 < 0:
-        reverse = True
-        theta += np.pi
+        return theta + np.pi, True
     else:
-        reverse = False
-
-    return theta, reverse
+        return theta, False
 
 
-def add_orientation(theta, ax, head_width, color, x0, reverse, shift=False):
-    y0 = x0
-    x1, y1 = x0 * np.cos(theta) * 0.5, y0 * np.sin(theta) * 0.5
-
-    if not reverse:
-        theta += np.pi / 2
-    else:
-        theta -= np.pi / 2
-
-    x2, y2 = x0 * np.cos(theta) * 0.5, y0 * np.sin(theta) * 0.5
-    if shift:
-        x0 -= 0.5
-        y0 -= 0.5
-
-    ax.arrow(x0, y0, x1, y1, head_width=head_width, color=color, zorder=100)
-    ax.text(x0 + 1.6 * x1, y0 + 1.6 * y1, "E", color=color, ha="center", va="center", zorder=100)
-
-    ax.arrow(x0, y0, x2, y2, head_width=head_width, color=color, zorder=100)
-    ax.text(x0 + 1.6 * x2, y0 + 1.6 * y2, "N", color=color, ha="center", va="center", zorder=100)
-
-
-def add_scalebar(ax, length, text, x0, y0):
-    ax.hlines(y=y0, xmin=x0, xmax=x0 + length, colors="black", ls="-", lw=1.5, label="%d km" % length)
-    ax.vlines(x=x0, ymin=y0 * 0.9, ymax=y0 * 1.1, colors="black", ls="-", lw=1.5)
-    ax.vlines(x=x0 + length, ymin=y0 * 0.9, ymax=y0 * 1.1, colors="black", ls="-", lw=1.5)
-    ax.text(x0 + length / 2, y0 * 1.2, text + '"', horizontalalignment="center", fontsize=10)
-
-
-def add_gaia_figure_elements(tpf, gaia_id, magnitude_limit, tpf_radius, search_scale):
-    # Get the positions of the Gaia sources
-    c1 = SkyCoord(tpf.ra * u.deg, tpf.dec * u.deg, frame="icrs")
-    search_radius = Angle(search_scale * tpf_radius * u.arcsec)
-
-    result = Vizier.query_region(c1, catalog=["I/345/gaia2"], radius=search_radius)["I/345/gaia2"]
-    try:
-        if not (result["Source"] == int(gaia_id)).any():
-            result_k = Vizier.query_object("Gaia DR2 " + gaia_id, catalog=["I/345/gaia2"])["I/345/gaia2"]
-            result_k = result_k[result_k["Source"] == int(gaia_id)]
-            result = vstack([result, result_k])
-
-        result = result.to_pandas()
-        result = result.sort_values(by="Gmag", ignore_index=True)
-        this = result[result.Source == int(gaia_id)].index[0]
-        result = result[result.Gmag < magnitude_limit].iloc[: max(this + 50, 300)]
-
-        year = ((tpf.time[0].jd - 2457206.375) * u.day).to(u.year)
-        pm_ra = ((np.nan_to_num(np.asarray(result.pmRA)) * u.milliarcsecond / u.year) * year).to(u.degree).value
-        pm_dec = ((np.nan_to_num(np.asarray(result.pmDE)) * u.milliarcsecond / u.year) * year).to(u.degree).value
-        result.RA_ICRS += pm_ra
-        result.DE_ICRS += pm_dec
-        coords = tpf.wcs.all_world2pix(np.vstack([result.RA_ICRS, result.DE_ICRS]).T, 0)
-        return coords, result["Gmag"], this
-
-    except TypeError:
-        return None, None, None
-
-
-def get_gaia_data(tpf):
+def add_orientation(ax: Axes, theta: float, pad: float, color: str, reverse: bool):
     """
-    Get Gaia parameters
+    Plot the orientation arrows.
+
+    Parameters
+    ----------
+    ax: `matplotlib.axes.Axes`
+        A matplotlib axes object to plot into
+    theta: float
+        Rotation angle of TPF [degree]
+    pad: float
+        The padding between the arrow base and the edge of the axes
+    color: str
+        The color of the orientation arrows
+    reverse: bool
+        Whether the direction of the TPF is reversed
+    """
+
+    def get_arrow_loc():
+        return pad * np.cos(theta) * 0.45 * ratio, pad * np.sin(theta) * 0.45
+
+    def get_text_loc(x, y):
+        return 1 - (pad * ratio + 1.7 * x), pad + 1.7 * y
+
+    ratio = ax.get_data_ratio()
+    x1, y1 = get_arrow_loc()
+    theta += -np.pi / 2 if reverse else np.pi / 2
+    x2, y2 = get_arrow_loc()
+
+    ax.arrow((1 - pad * ratio), pad, -x1, y1, color=color, head_width=0.01, transform=ax.transAxes, zorder=100)
+    ax.text(*get_text_loc(x1, y1), s="E", color=color, ha="center", va="center", transform=ax.transAxes, zorder=100)
+
+    ax.arrow((1 - pad * ratio), pad, -x2, y2, color=color, head_width=0.01, transform=ax.transAxes, zorder=100)
+    ax.text(*get_text_loc(x2, y2), s="N", color=color, ha="center", va="center", transform=ax.transAxes, zorder=100)
+
+
+def add_scalebar(ax: Axes, pad: float, length: float, scale: str):
+    """
+    Plot the scale bar.
+
+    Parameters
+    ----------
+    ax: `matplotlib.axes.Axes`
+        A matplotlib axes object to plot into
+    pad: float
+        The padding between the left endpoint of the scale bar and the edge of the axes
+    length: float
+        The length of the scale bar
+    scale: str
+        Scale of the scale bar
+    """
+
+    ratio = ax.get_data_ratio()
+    x_min = pad * ratio / 2
+    x_max = x_min + length
+    y_min = pad * 0.95
+    y_max = pad * 1.05
+    ax.hlines(y=pad, xmin=x_min, xmax=x_max, colors="k", ls="-", lw=1.5, transform=ax.transAxes)
+    ax.vlines(x=x_min, ymin=y_min, ymax=y_max, colors="k", ls="-", lw=1.5, transform=ax.transAxes)
+    ax.vlines(x=x_max, ymin=y_min, ymax=y_max, colors="k", ls="-", lw=1.5, transform=ax.transAxes)
+    ax.text(x_min + length / 2, pad * 1.1, scale, horizontalalignment="center", fontsize=10, transform=ax.transAxes)
+
+
+def query_nearby_gaia_objects(
+    tpf: Union[TessTargetPixelFile, KeplerTargetPixelFile], tpf_radius: float, magnitude_limit: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """
+    Query the objects in the area of TPF from Gaia Catalog (Now Gaia DR3).
+
+    Parameters
+    ----------
+    tpf: `lightkurve.TessTargetPixelFile` or `lightkurve.KeplerTargetPixelFile`
+        Target pixel files read by `lightkurve`
+    tpf_radius: float
+        The radius of the TPF [arcsec]
+    magnitude_limit: int or float
+        The maximum magnitude limit of the stars
 
     Returns
-    -----------------------
-    GaiaID, Gaia_mag
+    -------
+    x: 1-D ndarray
+        The x coordinates of the stars in pixel
+    y: 1-D ndarray
+        The y coordinates of the stars in pixel
+    mag: 1-D ndarray
+        The mean magnitudes of the stars in Gaia G band
+    target_index: int
+        The index of the target in the returned lists
     """
-    try:
-        # Query gaia directly from target label
-        label = tpf.get_header(ext=0).get("OBJECT")
-        source_ids = Simbad.query_objectids(label)["ID"]
-        for i in range(len(source_ids)):
-            if "Gaia DR2" in source_ids[i]:
-                gaia_id = source_ids[i].split(" ")[-1]
-                r = Catalogs.query_object("Gaia DR2 " + gaia_id, catalog="Gaia", data_release="DR2", radius=0.005)
-                gaia_mag = r[r["source_id"] == gaia_id]["phot_g_mean_mag"][0]
-                return gaia_id, gaia_mag
-    except TypeError:
-        pass
 
-    # Query gaia from target coordinate
-    print("Get gaia data from target id failed, using coordinate instead...")
-    ra = tpf.get_header(ext=0).get("RA_OBJ")
-    dec = tpf.get_header(ext=0).get("DEC_OBJ")
-    target_coord = SkyCoord(ra, dec, frame="icrs", unit="deg")
+    # Get the parameters of the Gaia sources
+    coord = SkyCoord(tpf.ra, tpf.dec, unit="deg", frame="icrs", equinox="J2000")
+    radius = u.Quantity(tpf_radius * 1.5, u.arcsec)
+    j = Gaia.cone_search_async(coord, radius)
+    r = j.get_results()
 
-    query_success = False
-    query_region = 10
-    attempts = 0
-    while not query_success and attempts <= 2:
-        result = Vizier.query_region(target_coord, catalog=["I/345/gaia2"], radius=Angle(query_region, "arcsec"))
-        try:
-            result = result["I/345/gaia2"]
-            query_success = True
-            dist = np.sqrt((result["RA_ICRS"] - ra) ** 2 + (result["DE_ICRS"] - dec) ** 2)
-            idx = np.argmin(dist)
-            return result[idx]["Source"], result[idx]["Gmag"]
-        except Exception:
-            query_region += 5
-            attempts += 1
-    return None, None
+    target_gaia_id = r[r["dist"] < 5 / 3600]["source_id"][0]
+    print("Found in Gaia DR3. Source ID: {}".format(target_gaia_id))
+
+    r.sort("phot_g_mean_mag")
+    target_index = np.nonzero(r["source_id"] == target_gaia_id)[0][0]
+    magnitude_limit = max(r["phot_g_mean_mag"][0] + 3, magnitude_limit)
+    r = r[r["phot_g_mean_mag"] < magnitude_limit][: max(target_index + 50, 300)]
+
+    qr = QTable([r["ra"].filled(), r["dec"].filled(), r["pmra"].filled(0), r["pmdec"].filled(0)])
+    coords_gaia = SkyCoord(
+        qr["ra"], qr["dec"], pm_ra_cosdec=qr["pmra"], pm_dec=qr["pmdec"], frame="icrs", obstime=REF_EPOCH
+    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=ErfaWarning)
+        coords_tess = coords_gaia.apply_space_motion(new_obstime=tpf.time[0])
+
+    x, y = tpf.wcs.world_to_pixel(coords_tess)
+    mag = np.asarray(r["phot_g_mean_mag"])
+
+    return x, y, mag, target_index
 
 
-def get_sky_img(tpf, theta, x_length, y_length, tpf_radius, reverse):
+def query_sky_img(
+    tpf: Union[TessTargetPixelFile, KeplerTargetPixelFile],
+    theta: float,
+    x_length: float,
+    y_length: float,
+    reverse: bool,
+) -> np.ndarray:
+    """
+    Query the image of the area of TPF from DSS2 Red Survey.
+
+    Parameters
+    ----------
+    tpf: `lightkurve.TessTargetPixelFile` or `lightkurve.KeplerTargetPixelFile`
+        Target pixel files read by `lightkurve`
+    theta: float
+        Rotation angle of TPF [degree]
+    x_length: float
+        The x length of the TPF [arcsecond]
+    y_length: float
+        The y length of the TPF [arcsecond]
+    reverse: bool
+        Whether the direction of the TPF is reversed
+
+    Returns
+    -------
+    2-D array
+    """
+
     def query_sky_data(hips):
         return hips2fits.query(
             hips=hips,
@@ -166,19 +216,14 @@ def get_sky_img(tpf, theta, x_length, y_length, tpf_radius, reverse):
             cmap="Greys",
         )
 
-    radius = 1.5 * tpf_radius
-
-    if tpf.mission == "Kepler" or tpf.mission == "K2":
-        n_pixel = 50
-    elif tpf.mission == "TESS":
-        n_pixel = 200
-    else:
-        raise ValueError
+    n_pixel = 200 if tpf.meta["TELESCOP"] == "TESS" else 50
 
     center_ra, center_dec = tpf.wcs.all_pix2world([(tpf.shape[1:][1] + 1) / 2], [(tpf.shape[1:][0] + 1) / 2], 1)
 
     if reverse:
         theta = np.pi - theta
+
+    radius = 1.5 * max(x_length, y_length)
 
     try:
         sky_data = query_sky_data("CDS/P/DSS2/red")
@@ -190,42 +235,47 @@ def get_sky_img(tpf, theta, x_length, y_length, tpf_radius, reverse):
     else:
         sky_data = np.flip(sky_data, axis=(0, 1))
 
-    x_pixel_rotated = n_pixel * y_length / radius
-    x_start = int((n_pixel - x_pixel_rotated) / 2)
+    x_pixel_sky = n_pixel * x_length / radius
+    x_start = int((n_pixel - x_pixel_sky) / 2)
     x_stop = n_pixel - x_start
 
-    y_pixel_rotated = n_pixel * x_length / radius
-    y_start = int((n_pixel - y_pixel_rotated) / 2)
+    y_pixel_sky = n_pixel * y_length / radius
+    y_start = int((n_pixel - y_pixel_sky) / 2)
     y_stop = n_pixel - y_start
 
-    sky_img = sky_data[x_start:x_stop, y_start:y_stop]
-
-    return x_pixel_rotated, y_pixel_rotated, sky_img
+    return sky_data[y_start:y_stop, x_start:x_stop]
 
 
-def plot_identification(ax_sky, tpf):
-    divider = make_axes_locatable(ax_sky)
+def plot_identification(ax: Axes, tpf: Union[TessTargetPixelFile, KeplerTargetPixelFile]):
+    """
+    Plot the identification charts.
+
+    Parameters
+    ----------
+    ax: `matplotlib.axes.Axes`
+        A matplotlib axes object to plot into
+    tpf: `lightkurve.TessTargetPixelFile` or `lightkurve.KeplerTargetPixelFile`
+        Target pixel files read by `lightkurve`
+    """
+
+    divider = make_axes_locatable(ax)
     ax_tpf = divider.append_axes("right", size="100%", pad=0.1)
     ax_cb = divider.append_axes("right", size="8%", pad=0.35)
+    ax_sky = ax
 
     # Use pixel scale for query size
-    telescope = tpf.get_header(ext=0).get("TELESCOP").strip()
-    if telescope == "TESS":
-        pixel_scale = 21.0
-    elif telescope == "Kepler":
-        pixel_scale = 4.0
-    else:
-        raise ValueError
+    pixel_scale = 21 if tpf.meta["TELESCOP"] == "TESS" else 4
 
     x_pixel, y_pixel = tpf.shape[1:][1], tpf.shape[1:][0]
     x_length = x_pixel * pixel_scale
     y_length = y_pixel * pixel_scale
-    tpf_radius = max(tpf.shape[1:]) * pixel_scale
+    tpf_radius = max(x_length, y_length)
     theta, reverse = calculate_theta(tpf.wcs.wcs)
 
     # TPF plot
-    norm = ImageNormalize(stretch=LogStretch())
-    median_flux = np.nanmedian(tpf.flux.value, axis=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        median_flux = np.nanmedian(tpf.flux.value, axis=0)
 
     try:
         division = int(np.log10(np.nanmax(median_flux)))
@@ -234,7 +284,7 @@ def plot_identification(ax_sky, tpf):
 
     image = median_flux / 10**division
 
-    splot = ax_tpf.imshow(image, norm=norm, origin="lower", cmap="viridis", zorder=0)
+    splot = ax_tpf.imshow(image, norm=ImageNormalize(stretch=LogStretch()), origin="lower", cmap="viridis", zorder=0)
     ax_tpf.set_xlim([-0.5, x_pixel - 0.5])
     ax_tpf.set_ylim([-0.5, y_pixel - 0.5])
     ax_tpf.set_xticks(np.arange(0, x_pixel, 1))
@@ -244,44 +294,26 @@ def plot_identification(ax_sky, tpf):
     ax_tpf.yaxis.set_ticks_position("right")
     ax_tpf.invert_xaxis()
 
-    # Get Gaia ID and mag of target
-    target_gaia_id, target_gaia_mag = get_gaia_data(tpf)
+    try:
+        x, y, gaia_mags, this = query_nearby_gaia_objects(tpf, tpf_radius, 18)
+        target_gaia_mag = gaia_mags[this]
 
-    add_gaia = False
-    if target_gaia_id is not None:
-        print("Found in Gaia DR2, Gaia ID: {}".format(target_gaia_id))
-        add_elements_attempt = 0
-        search_scale = 1.0
-        this = None
-        while add_elements_attempt <= 10 and this is None:
-            # Make the Gaia Figure Elements
-            try:
-                coords, gaia_mags, this = add_gaia_figure_elements(
-                    tpf, target_gaia_id, max(target_gaia_mag + 2.0, 18), tpf_radius, search_scale
-                )
-                x, y = coords[:, 0], coords[:, 1]
-                size_k = 1.2 * np.piecewise(
-                    target_gaia_mag,
-                    [target_gaia_mag < 12, 12 <= target_gaia_mag < 18, target_gaia_mag > 18],
-                    [70, lambda mag: 190 - mag * 10, 10],
-                )
-                if telescope == "Kepler":
-                    size_k = size_k * 5
-                size = size_k / 1.5 ** (gaia_mags - target_gaia_mag)
+        size_k = 1.2 * np.piecewise(
+            target_gaia_mag,
+            [target_gaia_mag < 12, 12 <= target_gaia_mag < 18, target_gaia_mag > 18],
+            [70, lambda mag: 190 - mag * 10, 10],
+        )
+        if tpf.meta["TELESCOP"] != "TESS":
+            size_k = size_k * 5
+        size = size_k / 1.5 ** (gaia_mags - target_gaia_mag)
 
-                ax_tpf.scatter(x, y, s=size, c="red", alpha=0.5, edgecolor=None, zorder=11)
-                ax_tpf.scatter(x[this], y[this], marker="x", c="white", s=size_k / 2, zorder=12)
-                add_gaia = True
+        ax_tpf.scatter(x, y, s=size, c="red", alpha=0.5, edgecolor=None, zorder=11)
+        ax_tpf.scatter(x[this], y[this], marker="x", c="white", s=size_k / 2.5, zorder=12)
 
-            except TypeError:
-                if not add_elements_attempt:
-                    print("Add gaia figure elements failed, retrying...")
-                search_scale += 0.05
-                add_elements_attempt += 1
-
-    if not add_gaia:
-        print("Not found in Gaia DR2")
-        ax_tpf.text(0.95 * x_pixel, 0.85 * y_pixel, "No Gaia DR2 Data", fontsize=14)
+    except IndexError:
+        print("Not found in Gaia DR3!")
+        at = AnchoredText("No Gaia DR3 Data", frameon=False, loc="upper left", prop=dict(size=13))
+        ax_tpf.add_artist(at)
 
     # Pipeline aperture
     aperture = tpf.pipeline_mask
@@ -295,28 +327,28 @@ def plot_identification(ax_sky, tpf):
                 ax_tpf.add_patch(patches.Rectangle(xy, 1, 1, color="gray", fill=False, alpha=0.2, lw=0.5, zorder=8))
 
     # Sky
-    y_pixel_sky, x_pixel_sky, sky_img = get_sky_img(tpf, theta, x_length, y_length, tpf_radius, reverse)
+    sky_img = query_sky_img(tpf, theta, x_length, y_length, reverse)
 
     ax_sky.imshow(sky_img, origin="lower")
     ax_sky.set_xticks([])
     ax_sky.set_yticks([])
     ax_sky.set_xticklabels([])
     ax_sky.set_yticklabels([])
-    ax_sky.set_xlim([0, x_pixel_sky])
-    ax_sky.set_ylim([0, y_pixel_sky])
+    ax_sky.set_xlim(0, sky_img.shape[1])
+    ax_sky.set_ylim(0, sky_img.shape[0])
     ax_sky.invert_xaxis()
-    ax_sky.text(0.96 * x_pixel_sky, 0.92 * y_pixel_sky, tpf.get_header(ext=0).get("OBJECT"), fontsize=13)
 
-    # Add orientation and scalebar
-    add_orientation(theta, ax_tpf, x_pixel / 100, "white", 0.15 * x_pixel, reverse, shift=True)
-    add_orientation(theta, ax_sky, x_pixel_sky / 100, "black", 0.15 * x_pixel_sky, reverse)
+    at = AnchoredText(tpf.meta["OBJECT"], frameon=False, loc="upper left", prop=dict(size=13))
+    ax_sky.add_artist(at)
 
-    if telescope == "TESS":
-        add_scalebar(ax_sky, 20 / tpf_radius * x_pixel_sky, "20", 0.8 * x_pixel_sky, 0.1 * y_pixel_sky)
-    elif telescope == "Kepler":
-        add_scalebar(ax_sky, 4 / tpf_radius * x_pixel_sky, "4", 0.8 * x_pixel_sky, 0.1 * y_pixel_sky)
+    # Add orientation arrows
+    add_orientation(ax=ax_tpf, theta=theta, pad=0.15, color="w", reverse=reverse)
+    add_orientation(ax=ax_sky, theta=theta, pad=0.15, color="k", reverse=reverse)
 
-    # Colorbar
+    # Add scale bar
+    add_scalebar(ax=ax_sky, pad=0.15, length=1 / x_pixel, scale='{}"'.format(pixel_scale))
+
+    # Add color bar
     cb = Colorbar(ax=ax_cb, mappable=splot, orientation="vertical", ticklocation="right")
 
     max_diff = int((np.nanmax(image) - np.nanmin(image)) / 0.01)
@@ -331,43 +363,35 @@ def plot_identification(ax_sky, tpf):
 
 if __name__ == "__main__":
     from pathlib import Path
-    from astropy.units import UnitsWarning
     import lightkurve as lk
     from matplotlib import pyplot as plt
-
-    import warnings
-
-    warnings.filterwarnings("ignore", category=RuntimeWarning)
-    warnings.filterwarnings("ignore", category=UnitsWarning)
-    warnings.filterwarnings("ignore", category=UserWarning)
 
     result_path = Path.cwd() / "results"
     result_path.mkdir(exist_ok=True)
 
-    file_path_list = [i for i in (Path.cwd() / "tpfs").glob("*.fit*")]
-    file_path_list.sort()
+    file_path_list = sorted([i for i in (Path.cwd() / "tpfs").glob("*.fit*")])
 
     index = 0
     for file_path in file_path_list:
         print("-------------------------")
-        print(file_path)
         tpf = lk.read(file_path)
 
         index += 1
-        label = tpf.get_header(ext=0).get("OBJECT")
-        print("Num {}, {}".format(index, label))
+        print("Num {}, {}".format(index, tpf.meta["OBJECT"]))
 
         mission = tpf.mission
         if mission == "TESS":
-            part = "S{:0>2d}".format(tpf.get_header(ext=0).get("SECTOR"))
+            part = "S{:0>2d}".format(tpf.meta["SECTOR"])
         elif mission == "K2":
-            part = "C{:0>2d}".format(tpf.get_header(ext=0).get("CAMPAIGN"))
+            part = "C{:0>2d}".format(tpf.meta["CAMPAIGN"])
         elif mission == "Kepler":
-            part = "Q{:0>2d}".format(tpf.get_header(ext=0).get("QUARTER"))
+            part = "Q{:0>2d}".format(tpf.meta["QUARTER"])
         else:
             raise ValueError
 
         fig, ax = plt.subplots(figsize=(9, 4))
         plot_identification(ax, tpf)
 
-        plt.savefig(result_path / Path("{}-{}.pdf".format(label.replace(" ", ""), part)), bbox_inches="tight")
+        plt.savefig(
+            result_path / Path("{}-{}.pdf".format(tpf.meta["OBJECT"].replace(" ", ""), part)), bbox_inches="tight"
+        )
